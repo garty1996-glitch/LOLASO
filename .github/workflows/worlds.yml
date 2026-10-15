@@ -30,7 +30,7 @@ jobs:
         run: python worlds_webhook.py
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-
+          BACKFILL: "true"
       - name: Guardar estado
         run: |
           git config user.name "worlds-bot"
