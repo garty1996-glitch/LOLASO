@@ -1,13 +1,13 @@
 """
 Worlds LoL -> Discord por webhook (sin servidor).
-
+ 
 Se ejecuta una vez y termina (pensado para GitHub Actions cada ~10 min).
 Por cada partida terminada publica dos bloques:
   1. Elegidos (10) y baneados (10) de la partida, cada campeón con su
      acumulado en el Worlds contando esa partida (elegido ×N, baneado ×N, WR).
   2. Global del Worlds: más elegidos, más baneados y presencia
      (presencia = veces elegido + veces baneado).
-
+ 
 Bans: se leen de ScoreboardGames y, si vienen vacíos, de PicksAndBansS7. Si una
 partida aún no tiene bans en Leaguepedia, el bot ESPERA (hasta BANS_WAIT_HOURS)
 antes de publicarla, para no mostrar contadores de bans incorrectos.
@@ -21,57 +21,81 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-
+ 
 import requests
-
+ 
 WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 TOURNAMENT = os.getenv("TOURNAMENT_PREFIX", "2026 Season World Championship")
 BACKFILL = os.getenv("BACKFILL", "false").lower() == "true"
 BANS_WAIT_HOURS = float(os.getenv("BANS_WAIT_HOURS", "3"))
 TOP_N = int(os.getenv("TOP_N", "10"))
-
+ 
 API = "https://lol.fandom.com/api.php"
 HEADERS = {"User-Agent": "WorldsDiscordBot/1.0 (uso personal, webhook de Discord)"}
 STATE_FILE = Path("state.json")
 ROLE_ORDER = {"Top": 0, "Jungle": 1, "Mid": 2, "Bot": 3, "Support": 4}
 ROLE_LABEL = {"Top": "Top", "Jungle": "Jungla", "Mid": "Mid", "Bot": "ADC", "Support": "Support"}
 GOLD = 0xF1C40F
-
+ 
 # clave normalizada de campeón -> nombre para mostrar
 display: dict[str, str] = {}
-
-
+ 
+ 
 def canon(name: str) -> str:
     """Normaliza un nombre de campeón (Kai'Sa == KaiSa == Kai&#039;Sa)."""
     clean = html.unescape(name or "").strip()
     key = re.sub(r"[^a-z0-9]", "", clean.lower())
     display.setdefault(key, clean)
     return key
-
-
+ 
+ 
 def new_stats() -> dict:
     return {"picks": 0, "wins": 0, "bans": 0}
-
-
+ 
+ 
 # ----------------------------------------------------------------- datos
+class RateLimited(Exception):
+    """Fandom limita las peticiones anónimas por IP (las de GitHub se comparten)."""
+ 
+ 
+RETRY_WAITS = [20, 40, 60]       # segundos entre reintentos
+wait_budget = [140]              # tope total de espera por ejecución (el job dura 5 min)
+ 
+ 
+def api_get(q: dict) -> dict:
+    for attempt in range(len(RETRY_WAITS) + 1):
+        r = requests.get(API, params=q, headers=HEADERS, timeout=30)
+        if r.status_code != 429:
+            r.raise_for_status()
+            data = r.json()
+            err = data.get("error")
+            if not err:
+                return data
+            if err.get("code") != "ratelimited":
+                raise RuntimeError(f"Leaguepedia devolvió un error: {err}")
+        if attempt == len(RETRY_WAITS) or wait_budget[0] < RETRY_WAITS[attempt]:
+            raise RateLimited()
+        wait = RETRY_WAITS[attempt]
+        wait_budget[0] -= wait
+        print(f"[limite] Leaguepedia limita las peticiones; reintento en {wait}s")
+        time.sleep(wait)
+ 
+ 
 def cargo_query(**params) -> list[dict]:
     rows, offset = [], 0
     while True:
         q = {"action": "cargoquery", "format": "json", "limit": "500",
              "offset": str(offset), **params}
-        r = requests.get(API, params=q, headers=HEADERS, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        if "error" in data:
-            raise RuntimeError(f"Leaguepedia devolvió un error: {data['error']}")
+        data = api_get(q)
+        time.sleep(2)  # cortesía entre peticiones
         batch = [{k: html.unescape(v) if isinstance(v, str) else v for k, v in x["title"].items()}
                  for x in data.get("cargoquery", [])]
         rows.extend(batch)
         if len(batch) < 500:
             return rows
         offset += 500
-
-
+ 
+ 
 def split_bans(raw) -> list[str]:
     out = []
     for c in (raw or "").split(","):
@@ -79,8 +103,8 @@ def split_bans(raw) -> list[str]:
         if c and c.lower() not in ("none", "null", "-"):
             out.append(c)
     return out
-
-
+ 
+ 
 def fetch_data():
     """Devuelve (filas de jugadores, metadatos por partida con sus bans)."""
     where = f"OverviewPage LIKE '{TOURNAMENT}%'"
@@ -105,7 +129,7 @@ def fetch_data():
             "b1": split_bans(g.get("B1")),
             "b2": split_bans(g.get("B2")),
         }
-
+ 
     # Fuente alternativa de bans: tabla PicksAndBansS7 (un campo por ban).
     if any(not (m["b1"] or m["b2"]) for m in meta.values()):
         try:
@@ -124,8 +148,8 @@ def fetch_data():
         except Exception as e:
             print(f"[bans] fuente alternativa no disponible: {e}")
     return players, meta
-
-
+ 
+ 
 def group_games(rows):
     games, order = defaultdict(list), []
     for r in rows:
@@ -133,8 +157,8 @@ def group_games(rows):
             order.append(r["GameId"])
         games[r["GameId"]].append(r)
     return [games[g] for g in order if len(games[g]) >= 10]
-
-
+ 
+ 
 def add_game(stats, game, bans):
     for p in game:
         s = stats[canon(p["Champion"])]
@@ -142,8 +166,8 @@ def add_game(stats, game, bans):
         s["wins"] += p["Win"] == "Yes"
     for champ in bans:
         stats[canon(champ)]["bans"] += 1
-
-
+ 
+ 
 def game_age_hours(game) -> float:
     """Horas desde el inicio de la partida (inf si no se puede leer la fecha)."""
     try:
@@ -151,26 +175,26 @@ def game_age_hours(game) -> float:
         return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
     except Exception:
         return float("inf")
-
-
+ 
+ 
 # ----------------------------------------------------------------- formato
 def wr(s) -> str:
     if not s["picks"]:
         return "WR —"
     return f"WR {round(100 * s['wins'] / s['picks'])}% ({s['wins']}-{s['picks'] - s['wins']})"
-
-
+ 
+ 
 def cut(lines: list[str]) -> str:
     text = "\n".join(lines) or "—"
     return text if len(text) <= 1024 else text[:1020] + "…"
-
-
+ 
+ 
 def game_embed(n, game, m, stats, bans_missing) -> dict:
     teams = defaultdict(list)
     for p in game:
         teams[p["Team"]].append(p)
     winner = next((t for t, ps in teams.items() if ps[0]["Win"] == "Yes"), "?")
-
+ 
     fields = []
     for team, players in teams.items():
         players.sort(key=lambda p: ROLE_ORDER.get(p["Role"], 9))
@@ -180,7 +204,7 @@ def game_embed(n, game, m, stats, bans_missing) -> dict:
             role = ROLE_LABEL.get(p["Role"], p["Role"])
             lines.append(f"`{role:<7}` **{display[k]}** ×{stats[k]['picks']} · {wr(stats[k])}")
         fields.append({"name": f"🎯 Elegidos · {team}", "value": cut(lines)})
-
+ 
     if bans_missing:
         fields.append({"name": "🚫 Baneados",
                        "value": "⚠️ Leaguepedia aún no tiene los bans de esta partida."})
@@ -188,7 +212,7 @@ def game_embed(n, game, m, stats, bans_missing) -> dict:
         for team, bans in ((m["t1"], m["b1"]), (m["t2"], m["b2"])):
             lines = [f"**{display[canon(c)]}** ×{stats[canon(c)]['bans']}" for c in bans]
             fields.append({"name": f"🚫 Baneados · {team}", "value": cut(lines)})
-
+ 
     return {
         "title": " vs ".join(teams),
         "description": f"🏆 Victoria de **{winner}**",
@@ -196,19 +220,19 @@ def game_embed(n, game, m, stats, bans_missing) -> dict:
         "fields": fields,
         "footer": {"text": f"Partida nº{n} del Worlds · ×N = veces en el Worlds, contando esta partida"},
     }
-
-
+ 
+ 
 def global_embed(stats) -> dict:
     def name(k):
         return display[k]
-
+ 
     picked = sorted((k for k in stats if stats[k]["picks"]),
                     key=lambda k: (-stats[k]["picks"], name(k).lower()))[:TOP_N]
     banned = sorted((k for k in stats if stats[k]["bans"]),
                     key=lambda k: (-stats[k]["bans"], name(k).lower()))[:TOP_N]
     present = sorted((k for k in stats if stats[k]["picks"] + stats[k]["bans"]),
                      key=lambda k: (-(stats[k]["picks"] + stats[k]["bans"]), name(k).lower()))[:TOP_N]
-
+ 
     return {
         "title": "📊 Global del Worlds tras esta partida",
         "color": GOLD,
@@ -225,8 +249,8 @@ def global_embed(stats) -> dict:
                            for i, k in enumerate(present, 1)])},
         ],
     }
-
-
+ 
+ 
 def post_embeds(embeds: list[dict]) -> None:
     for _ in range(5):
         r = requests.post(WEBHOOK_URL, json={"embeds": embeds}, timeout=30)
@@ -237,23 +261,29 @@ def post_embeds(embeds: list[dict]) -> None:
         time.sleep(1.5)
         return
     raise RuntimeError("Discord sigue limitando el webhook")
-
-
+ 
+ 
 # ----------------------------------------------------------------- principal
 def main() -> int:
     state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else None
     first_run = state is None
     seen = set(state["seen"]) if state else set()
-
-    rows, meta = fetch_data()
+ 
+    try:
+        rows, meta = fetch_data()
+    except RateLimited:
+        # No es un error del bot: se reintenta solo en la próxima ejecución.
+        print("[aviso] Leaguepedia sigue limitando las peticiones desde esta IP. "
+              "No se publica nada ahora; se reintenta en la próxima ejecución.")
+        return 0
     for r in rows:  # los nombres de los picks mandan como nombre para mostrar
         canon(r["Champion"])
     games = group_games(rows)
-
+ 
     with_bans = sum(1 for g in games if meta.get(g[0]["GameId"], {}).get("b1")
                     or meta.get(g[0]["GameId"], {}).get("b2"))
     print(f"[info] partidas completas: {len(games)} · con bans: {with_bans} · ya publicadas: {len(seen)}")
-
+ 
     stats = defaultdict(new_stats)
     posted = 0
     for n, g in enumerate(games, 1):
@@ -265,21 +295,22 @@ def main() -> int:
         if first_run and not BACKFILL:
             seen.add(gid)  # no inundar el canal con partidas antiguas
             continue
-
+ 
         bans_missing = not (m["b1"] or m["b2"])
         if bans_missing and game_age_hours(g) < BANS_WAIT_HOURS:
             print(f"[espera] {gid}: aún sin bans en Leaguepedia, se reintenta en la próxima ejecución")
             break  # mantiene el orden: las siguientes esperan a esta
-
+ 
         post_embeds([game_embed(n, g, m, stats, bans_missing), global_embed(stats)])
         seen.add(gid)
         posted += 1
         STATE_FILE.write_text(json.dumps({"seen": sorted(seen)}))  # por si algo falla a mitad
-
+ 
     STATE_FILE.write_text(json.dumps({"seen": sorted(seen)}))
     print(f"Partidas nuevas publicadas: {posted}")
     return 0
-
-
+ 
+ 
 if __name__ == "__main__":
     sys.exit(main())
+ 
