@@ -29,6 +29,7 @@ TOURNAMENT = os.getenv("TOURNAMENT_PREFIX", "2026 Season World Championship")
 BACKFILL = os.getenv("BACKFILL", "false").lower() == "true"
 BANS_WAIT_HOURS = float(os.getenv("BANS_WAIT_HOURS", "3"))
 TOP_N = int(os.getenv("TOP_N", "10"))
+MIN_WR_PICKS = int(os.getenv("MIN_WR_PICKS", "5"))  # picks mínimos para entrar en el top de winrate
 
 API = "https://lol.fandom.com/api.php"
 HEADERS = {"User-Agent": "WorldsDiscordBot/1.0 (uso personal, webhook de Discord)"}
@@ -64,10 +65,16 @@ def login() -> None:
     Usa los secretos FANDOM_USER (formato Usuario@NombreBot) y FANDOM_PASS.
     Si no existen o falla, se sigue de forma anónima. Nunca se imprime la clave.
     """
-    user, pw = os.getenv("FANDOM_USER"), os.getenv("FANDOM_PASS")
+    raw_user, raw_pw = os.getenv("FANDOM_USER") or "", os.getenv("FANDOM_PASS") or ""
+    user, pw = raw_user.strip(), raw_pw.strip()  # quita espacios/saltos de línea pegados por error
     if not (user and pw):
         print("[login] sin credenciales de Fandom: consultas anónimas")
         return
+    # Diagnóstico sin revelar nada: solo longitudes y formato.
+    print(f"[login] usuario: {len(user)} caracteres, "
+          f"{'con' if '@' in user else 'SIN'} '@' (debe ser Usuario@NombreBot) · "
+          f"clave: {len(pw)} caracteres (las bot passwords generadas suelen tener 32)"
+          + (" · se han quitado espacios sobrantes" if (user, pw) != (raw_user, raw_pw) else ""))
     try:
         r = SESSION.get(API, params={"action": "query", "meta": "tokens",
                                      "type": "login", "format": "json"}, timeout=30)
@@ -263,6 +270,16 @@ def global_embed(stats) -> dict:
     present = sorted((k for k in stats if stats[k]["picks"] + stats[k]["bans"]),
                      key=lambda k: (-(stats[k]["picks"] + stats[k]["bans"]), name(k).lower()))[:TOP_N]
 
+    # Top winrate: solo campeones con al menos MIN_WR_PICKS picks; desempata quien tiene más picks.
+    best_wr = sorted((k for k in stats if stats[k]["picks"] >= MIN_WR_PICKS),
+                     key=lambda k: (-stats[k]["wins"] / stats[k]["picks"], -stats[k]["picks"],
+                                    name(k).lower()))[:TOP_N]
+    wr_lines = [f"{i}. **{name(k)}** — {round(100 * stats[k]['wins'] / stats[k]['picks'])}% "
+                f"({stats[k]['wins']}-{stats[k]['picks'] - stats[k]['wins']})"
+                for i, k in enumerate(best_wr, 1)]
+    if not wr_lines:
+        wr_lines = [f"Aún ningún campeón con {MIN_WR_PICKS} o más picks."]
+
     return {
         "title": "📊 Global del Worlds tras esta partida",
         "color": GOLD,
@@ -277,6 +294,7 @@ def global_embed(stats) -> dict:
              "value": cut([f"{i}. **{name(k)}** — {stats[k]['picks'] + stats[k]['bans']} "
                            f"(🎯{stats[k]['picks']} + 🚫{stats[k]['bans']})"
                            for i, k in enumerate(present, 1)])},
+            {"name": f"🏆 TOP {TOP_N} WINRATE (mínimo {MIN_WR_PICKS} picks)", "value": cut(wr_lines)},
         ],
     }
 
