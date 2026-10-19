@@ -24,12 +24,26 @@ from pathlib import Path
 
 import requests
 
-WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
+def load_webhooks() -> list[str]:
+    """Webhooks de destino: DISCORD_WEBHOOK_URL y DISCORD_WEBHOOK_URL_2 (también admiten varias
+    URLs separadas por comas o saltos de línea en cualquiera de las dos)."""
+    urls = []
+    for var in ("DISCORD_WEBHOOK_URL", "DISCORD_WEBHOOK_URL_2"):
+        for u in re.split(r"[,\s]+", os.getenv(var, "")):
+            if u and u not in urls:
+                urls.append(u)
+    if not urls:
+        sys.exit("Falta el secreto DISCORD_WEBHOOK_URL")
+    return urls
+
+
+WEBHOOKS = load_webhooks()
 TOURNAMENT = os.getenv("TOURNAMENT_PREFIX", "2026 Season World Championship")
 BACKFILL = os.getenv("BACKFILL", "false").lower() == "true"
 BANS_WAIT_HOURS = float(os.getenv("BANS_WAIT_HOURS", "3"))
 TOP_N = int(os.getenv("TOP_N", "10"))
 MIN_WR_PICKS = int(os.getenv("MIN_WR_PICKS", "5"))  # picks mínimos para entrar en el top de winrate
+BACKFILL_NEW_WEBHOOKS = os.getenv("BACKFILL_NEW_WEBHOOKS", "false").lower() == "true"
 
 API = "https://lol.fandom.com/api.php"
 HEADERS = {"User-Agent": "WorldsDiscordBot/1.0 (uso personal, webhook de Discord)"}
@@ -299,9 +313,15 @@ def global_embed(stats) -> dict:
     }
 
 
-def post_embeds(embeds: list[dict]) -> None:
+def webhook_key(url: str, i: int) -> str:
+    """Identificador del webhook para el estado: su ID numérico (no el token, que es secreto)."""
+    m = re.search(r"/webhooks/(\d+)/", url)
+    return m.group(1) if m else f"w{i}"
+
+
+def post_embeds(url: str, embeds: list[dict]) -> None:
     for _ in range(5):
-        r = requests.post(WEBHOOK_URL, json={"embeds": embeds}, timeout=30)
+        r = requests.post(url, json={"embeds": embeds}, timeout=30)
         if r.status_code == 429:  # rate limit de Discord
             time.sleep(float(r.json().get("retry_after", 2)) + 0.5)
             continue
@@ -312,10 +332,22 @@ def post_embeds(embeds: list[dict]) -> None:
 
 
 # ----------------------------------------------------------------- principal
+def save_state(sent: dict) -> None:
+    seen = set().union(*sent.values()) if sent else set()
+    STATE_FILE.write_text(json.dumps({"seen": sorted(seen),
+                                      "sent": {k: sorted(v) for k, v in sent.items()}}))
+
+
 def main() -> int:
     state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else None
     first_run = state is None
-    seen = set(state["seen"]) if state else set()
+    seen = set(state["seen"]) if state else set()   # publicadas en al menos un destino
+    targets = {webhook_key(u, i): u for i, u in enumerate(WEBHOOKS)}
+    keys = list(targets)
+    # Partidas ya enviadas a cada webhook. Un estado antiguo (sin "sent") se asigna al primero.
+    sent = {k: set(v) for k, v in (state or {}).get("sent", {}).items() if k in targets}
+    if state and "sent" not in state:
+        sent[keys[0]] = set(seen)
 
     login()
     try:
@@ -331,18 +363,31 @@ def main() -> int:
 
     with_bans = sum(1 for g in games if meta.get(g[0]["GameId"], {}).get("b1")
                     or meta.get(g[0]["GameId"], {}).get("b2"))
-    print(f"[info] partidas completas: {len(games)} · con bans: {with_bans} · ya publicadas: {len(seen)}")
+    all_ids = {g[0]["GameId"] for g in games}
+    print(f"[info] partidas completas: {len(games)} · con bans: {with_bans} · "
+          f"ya publicadas: {len(seen)} · webhooks: {len(keys)}")
+
+    # Webhooks sin historial: por defecto empiezan "desde ahora" (no se les reenvía lo ya publicado
+    # en otro sitio). Con BACKFILL (primer arranque) o BACKFILL_NEW_WEBHOOKS se les envía todo.
+    for k in keys:
+        if k in sent:
+            continue
+        if first_run:
+            sent[k] = set() if BACKFILL else set(all_ids)
+        else:
+            sent[k] = set() if BACKFILL_NEW_WEBHOOKS else set(seen)
+            print(f"[webhook] nuevo destino {k}: "
+                  f"{'se le enviará todo el historial' if BACKFILL_NEW_WEBHOOKS else 'empieza desde ahora'}")
 
     stats = defaultdict(new_stats)
     posted = 0
+    blocked = set()  # webhooks que han fallado en esta ejecución (se salta el resto para no desordenar)
     for n, g in enumerate(games, 1):
         gid = g[0]["GameId"]
         m = meta.get(gid) or {"t1": "Equipo 1", "t2": "Equipo 2", "b1": [], "b2": []}
         add_game(stats, g, m["b1"] + m["b2"])
-        if gid in seen:
-            continue
-        if first_run and not BACKFILL:
-            seen.add(gid)  # no inundar el canal con partidas antiguas
+        pending = [k for k in keys if gid not in sent[k] and k not in blocked]
+        if not pending:
             continue
 
         bans_missing = not (m["b1"] or m["b2"])
@@ -350,13 +395,23 @@ def main() -> int:
             print(f"[espera] {gid}: aún sin bans en Leaguepedia, se reintenta en la próxima ejecución")
             break  # mantiene el orden: las siguientes esperan a esta
 
-        post_embeds([game_embed(n, g, m, stats, bans_missing), global_embed(stats)])
-        seen.add(gid)
-        posted += 1
-        STATE_FILE.write_text(json.dumps({"seen": sorted(seen)}))  # por si algo falla a mitad
+        embeds = [game_embed(n, g, m, stats, bans_missing), global_embed(stats)]
+        for k in pending:
+            try:
+                post_embeds(targets[k], embeds)
+            except Exception as e:
+                # No se imprime la URL (lleva el token). Se reintenta en la próxima ejecución.
+                status = getattr(getattr(e, "response", None), "status_code", "")
+                print(f"[error] webhook {k} falló ({type(e).__name__} {status}); "
+                      "se reintenta en la próxima ejecución")
+                blocked.add(k)
+                continue
+            sent[k].add(gid)
+            posted += 1
+            save_state(sent)  # por si algo falla a mitad
 
-    STATE_FILE.write_text(json.dumps({"seen": sorted(seen)}))
-    print(f"Partidas nuevas publicadas: {posted}")
+    save_state(sent)
+    print(f"Mensajes publicados: {posted}")
     return 0
 
 
